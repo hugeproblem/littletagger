@@ -2,12 +2,13 @@ import json
 import math
 import os
 import shutil
+import threading
 from collections import namedtuple
 
-from PyQt5.QtWidgets import QApplication, QCheckBox, QComboBox, QLabel, QPushButton, QMainWindow, QScrollArea, QHBoxLayout, QVBoxLayout, QWidget, QSizePolicy, QSplitter
+from PyQt5.QtWidgets import QApplication, QCheckBox, QComboBox, QLabel, QPushButton, QMainWindow, QScrollArea, QHBoxLayout, QVBoxLayout, QWidget, QSizePolicy, QSplitter, QLayoutItem
 from PyQt5.QtWidgets import QLineEdit, QTextEdit, QMenu, QListView, QAction, QFileSystemModel, QTreeView
-from PyQt5.QtWidgets import QFileDialog, QDialog, QListWidget, QListWidgetItem, QMessageBox
-from PyQt5.QtGui import QPixmap, QCursor, QImageReader, QIcon, QColor, QDesktopServices
+from PyQt5.QtWidgets import QFileDialog, QDialog, QListWidget, QListWidgetItem, QMessageBox, QSpacerItem
+from PyQt5.QtGui import QPixmap, QImage, QCursor, QImageReader, QIcon, QColor, QDesktopServices, QFont
 from PyQt5.QtCore import Qt, QDir, QSize, QPoint, QMutex, QUrl, QProcess, QSysInfo
 from PyQt5.QtCore import QItemSelectionModel, QItemSelection
 from PyQt5 import QtCore
@@ -17,12 +18,140 @@ QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True) #use highdpi icons
 
 ImageRecord = namedtuple('ImageRecord', ['path', 'tag_path', 'tags'])
 
+def hline(*widgets, **kwargs):
+    stretch = kwargs.get('proportions', None)
+    hbox = QHBoxLayout()
+    for w in widgets:
+        if isinstance(w, QWidget):
+            hbox.addWidget(w)
+        elif isinstance(w, QLayoutItem):
+            hbox.addItem(w)
+    if stretch:
+        for i, p in enumerate(stretch):
+            if p:
+                hbox.setStretch(i, p)
+    return hbox
+
+class CropResizeAndSaveToDialog(QDialog):
+    image_cropped = QtCore.pyqtSignal(str)
+
+    def __init__(self, parent=None, files=[]):
+        super().__init__(parent)
+        self.files = files
+        self.setFont(QFont('Helvetica, Arial, Sans Serif', 11))
+        
+        # Create widgets for the dialog
+        self.item_list = QListWidget()
+        self.item_map = {}
+        for path in self.files:
+            listitem = QListWidgetItem(path)
+            self.item_list.addItem(listitem)
+            self.item_map[path] = listitem
+        size_label = QLabel('Width x Height:')
+        self.crop_width_edit = QLineEdit()
+        self.crop_width_edit.setText('512')
+        self.crop_width_edit.setFixedWidth(50)
+        x_label = QLabel('x')
+        self.crop_height_edit = QLineEdit()
+        self.crop_height_edit.setText('512')
+        self.crop_height_edit.setFixedWidth(50)
+        self.save_dir_label = QLabel('Save To:')
+        self.save_dir_edit = QLineEdit()
+        self.save_dir_edit.setText(os.path.join(os.path.commonprefix(self.files), 'prepared'))
+        self.save_dir_button = QPushButton('...')
+        self.save_dir_button.clicked.connect(self.browse_save_dir)
+        self.do_override = QCheckBox('Override existing files')
+        self.prefix = QLineEdit()
+        self.prefix.setFixedWidth(100)
+        self.save_button = QPushButton('Save')
+        self.save_button.clicked.connect(self.save_images)
+        self.cancel_button = QPushButton('Cancel')
+        self.cancel_button.clicked.connect(self.do_cancel)
+        self.work_thread = None
+        self.canceled = False
+        
+        # Create layout for the dialog
+        layout = QVBoxLayout()
+        layout.addWidget(self.item_list)
+        layout.addLayout(hline(size_label, self.crop_width_edit, x_label, self.crop_height_edit, QSpacerItem(0,0,QSizePolicy.Expanding), stretch=(0, 0, 0, 0, 1)))
+        layout.addLayout(hline(self.save_dir_label, self.save_dir_edit, self.save_dir_button, stretch=(0, 1, 0)))
+        layout.addLayout(hline(self.do_override, QLabel('Name prefix:'), self.prefix, stretch=(0, 0, 1)))
+        layout.addLayout(hline(self.save_button, self.cancel_button))
+        self.setLayout(layout)
+        
+    def browse_save_dir(self):
+        """Open a file dialog to choose the directory to save the cropped images"""
+        save_dir = QFileDialog.getExistingDirectory(self, 'Choose Directory', self.save_dir_edit.text())
+        if save_dir:
+            self.save_dir_edit.setText(save_dir)
+
+    def do_cancel(self):
+        self.canceled = True
+        if self.work_thread:
+            self.work_thread.join()
+        self.reject()
+        
+    def save_images(self):
+        """Crop and save the selected images to the chosen directory"""
+        # Don't press twice
+        self.save_button.setEnabled(False)
+
+        # Get the crop width and height from the edit boxes
+        crop_width = int(self.crop_width_edit.text())
+        crop_height = int(self.crop_height_edit.text())
+
+        override = self.do_override.isChecked()
+        prefix = self.prefix.text()
+        
+        # Get the save directory from the edit box
+        save_dir = self.save_dir_edit.text()
+        if not save_dir:
+            QMessageBox.warning(self, 'No Save Directory', 'Please choose a directory to save the cropped images.')
+            return
+        if not os.path.exists(save_dir):
+            try:
+                os.makedirs(save_dir)
+            except:
+                QMessageBox.warning(self, 'Invalid Save Directory', 'The chosen directory is invalid.')
+                return
+
+        def thread_function():
+            # Crop and save each selected image
+            for path in self.files:
+                if self.canceled:
+                    break
+                image = QImage(path)
+                # resize to best matching size, crop the center area if aspect ratio is different
+                if image.width()/image.height() > crop_width/crop_height:
+                    image = image.scaledToHeight(crop_height, Qt.SmoothTransformation)
+                    crop_x = (image.width() - crop_width) // 2
+                    crop_y = 0
+                    cropped_image = image.copy(crop_x, crop_y, crop_width, crop_height)
+                else:
+                    image = image.scaledToWidth(crop_width, Qt.SmoothTransformation)
+                    crop_x = 0
+                    crop_y = (image.height() - crop_height) // 2
+                    cropped_image = image.copy(crop_x, crop_y, crop_width, crop_height)
+                
+                save_path = os.path.join(save_dir, prefix+os.path.basename(path))
+                if override or not os.path.exists(save_path):
+                    cropped_image.save(save_path)
+                self.image_cropped.emit(path)
+                self.item_list.removeItemWidget(self.item_map[path])
+            self.accept()
+
+        self.work_thread = threading.Thread(target=thread_function)
+        self.work_thread.start()
+
 class ImageTagger(QMainWindow):
+    thumbnail_size = 512
+
     def __init__(self):
         super().__init__()
 
         self.setWindowTitle('Image Tagger')
         self.setAcceptDrops(True)
+        self.setFont(QFont('Helvetica, Arial, Sans Serif', 12))
 
         # Create a splitter widget to divide the window into two panels
         self.splitter = QSplitter()
@@ -37,9 +166,12 @@ class ImageTagger(QMainWindow):
         self.model.setNameFilters(['*.jpg', '*.jpeg', '*.png'])
         self.model.setNameFilterDisables(False)
         self.tree = QTreeView()
+        self.tree.setColumnWidth(0, 300)
         self.tree.setModel(self.model)
         self.tree.setRootIndex(self.model.index("/"))
         self.tree.setSelectionMode(QTreeView.ExtendedSelection)
+        self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self.filetree_context_menu)
 
         # Add the tree view widget to the vertical box layout
         vbox.addWidget(self.tree)
@@ -62,11 +194,13 @@ class ImageTagger(QMainWindow):
         self.label.setAlignment(Qt.AlignCenter)
         self.label.setMinimumSize(512, 512) # Set the minimum size of the label widget to 512x512
 
-        right_panel = QWidget()
-        right_panel_layout = QVBoxLayout()
-        right_panel_layout.addWidget(self.label)
+        right_panel = QSplitter(Qt.Vertical)
+        right_panel_down = QWidget()
+        right_panel_down_layout = QVBoxLayout()
+        right_panel.addWidget(self.label)
 
         self.thumbnail_list = QListWidget()
+        self.thumbnail_list.setMinimumSize(512, 600)
         self.thumbnail_list.setFlow(QListWidget.LeftToRight)
         self.thumbnail_list.setResizeMode(QListWidget.Adjust)
         self.thumbnail_list.setViewMode(QListWidget.IconMode)
@@ -77,7 +211,7 @@ class ImageTagger(QMainWindow):
         self.thumbnail_list.itemDoubleClicked.connect(self.thumbnail_double_clicked)
         self.thumbnail_list.keyPressEvent = self.thumbnail_key_pressed
         self.thumbnail_list.selectionModel().selectionChanged.connect(self.on_thumbnail_selection_changed)
-        right_panel_layout.addWidget(self.thumbnail_list)
+        right_panel.addWidget(self.thumbnail_list)
         self.thumbnail_list.hide()
 
         taglist_layout = QVBoxLayout()
@@ -106,7 +240,7 @@ class ImageTagger(QMainWindow):
         hbox.addLayout(taglist_layout)
         hbox.addLayout(tagpool_layout)
 
-        right_panel_layout.addLayout(hbox)
+        right_panel_down_layout.addLayout(hbox)
 
         self.tags_edit = QLineEdit()
         self.tags_edit.setPlaceholderText('Add tags here')
@@ -116,9 +250,11 @@ class ImageTagger(QMainWindow):
         self.add_tag_button = QPushButton('Add Tag')
         self.add_tag_button.clicked.connect(lambda: self.add_tag(self.tags_edit.text()) or self.tags_edit.setText('') or self.highlight_pool())
         hbox.addWidget(self.add_tag_button)
-        right_panel_layout.addLayout(hbox)
+        right_panel_down_layout.addLayout(hbox)
 
-        right_panel.setLayout(right_panel_layout)
+        right_panel_down.setLayout(right_panel_down_layout)
+
+        right_panel.addWidget(right_panel_down)
 
         # Add the label widget to the right panel of the splitter
         self.splitter.addWidget(right_panel)
@@ -197,6 +333,21 @@ class ImageTagger(QMainWindow):
 
         menu.exec_(self.tagpool.viewport().mapToGlobal(pos))
 
+    def filetree_context_menu(self, pos):
+        menu = QMenu()
+        def show_crop_dlg():
+            selection = self.tree.selectionModel().selectedRows()
+            files = []
+            for index in selection:
+                files.append(self.model.filePath(index))
+            crop_dlg = CropResizeAndSaveToDialog(self, files)
+            crop_dlg.setModal(True)
+            crop_dlg.exec_()
+        resize_dlg_action = QAction('Resize / Crop Selected Items ...', self)
+        resize_dlg_action.triggered.connect(show_crop_dlg)
+        menu.addAction(resize_dlg_action)
+        menu.exec_(self.tree.viewport().mapToGlobal(pos))
+
     def select_images_with_tag(self, tag):
         selection = QItemSelection()
         for path in self.tag_cache:
@@ -227,8 +378,8 @@ class ImageTagger(QMainWindow):
 
     def save_current_tags(self):
         current_tags = [tag.text() for tag in self.taglist.findItems('', Qt.MatchContains)]
-        removed_common_tags = self.common_tags - set(current_tags)
-        added_common_tags = set(current_tags) - self.common_tags
+        removed_common_tags = (self.common_tags or set()) - set(current_tags)
+        added_common_tags = set(current_tags) - (self.common_tags or set())
         print(f'removed common tags: {removed_common_tags}')
         if len(self.current_images) == 1:
             path = list(self.current_images.keys())[0]
@@ -264,7 +415,7 @@ class ImageTagger(QMainWindow):
         processed_files = set()
         for path in paths:
             if path not in self.image_cache:
-                self.image_cache[path] = QPixmap(path)
+                self.image_cache[path] = QPixmap(path).scaledToWidth(self.thumbnail_size)
             self.filepath_cache[os.path.basename(path)] = path
             if path in processed_files: # skip duplicates, as multiple indices can point to the same file
                 continue
@@ -290,7 +441,7 @@ class ImageTagger(QMainWindow):
         self.tagpool.sortItems()
         self.taglist.clear()
         self.taglist.clearSelection()
-        for tag in self.common_tags:
+        for tag in self.common_tags or []:
             self.taglist.addItem(tag)
         self.highlight_pool()
 
@@ -326,7 +477,7 @@ class ImageTagger(QMainWindow):
         for index in indices:
             path = self.model.filePath(index)
             if path not in self.image_cache:
-                self.image_cache[path] = QPixmap(path)
+                self.image_cache[path] = QPixmap(path).scaledToWidth(self.thumbnail_size)
             self.filepath_cache[os.path.basename(path)] = path
             if path in processed_files: # skip duplicates, as multiple indices can point to the same file
                 continue

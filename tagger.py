@@ -6,7 +6,7 @@ import threading
 from collections import namedtuple
 
 from PyQt5.QtWidgets import QApplication, QCheckBox, QComboBox, QLabel, QPushButton, QMainWindow, QScrollArea, QHBoxLayout, QVBoxLayout, QWidget, QSizePolicy, QSplitter, QLayoutItem
-from PyQt5.QtWidgets import QLineEdit, QTextEdit, QMenu, QListView, QAction, QFileSystemModel, QTreeView
+from PyQt5.QtWidgets import QLineEdit, QTextEdit, QMenu, QListView, QAction, QFileSystemModel, QTreeView, QProgressBar
 from PyQt5.QtWidgets import QFileDialog, QDialog, QListWidget, QListWidgetItem, QMessageBox, QSpacerItem
 from PyQt5.QtGui import QPixmap, QImage, QCursor, QImageReader, QIcon, QColor, QDesktopServices, QFont
 from PyQt5.QtCore import Qt, QDir, QSize, QPoint, QMutex, QUrl, QProcess, QSysInfo
@@ -34,6 +34,7 @@ def hline(*widgets, **kwargs):
 
 class CropResizeAndSaveToDialog(QDialog):
     image_cropped = QtCore.pyqtSignal(str)
+    image_all_croped = QtCore.pyqtSignal()
 
     def __init__(self, parent=None, files=[]):
         super().__init__(parent)
@@ -63,16 +64,21 @@ class CropResizeAndSaveToDialog(QDialog):
         self.do_override = QCheckBox('Override existing files')
         self.prefix = QLineEdit()
         self.prefix.setFixedWidth(100)
+        self.progress = QProgressBar()
         self.save_button = QPushButton('Save')
         self.save_button.clicked.connect(self.save_images)
         self.cancel_button = QPushButton('Cancel')
         self.cancel_button.clicked.connect(self.do_cancel)
         self.work_thread = None
         self.canceled = False
+        self.image_cropped.connect(self.on_image_croped)
+        self.image_all_croped.connect(self.on_image_all_croped)
+        self.num_job_done = 0
         
         # Create layout for the dialog
         layout = QVBoxLayout()
         layout.addWidget(self.item_list)
+        layout.addWidget(self.progress)
         layout.addLayout(hline(size_label, self.crop_width_edit, x_label, self.crop_height_edit, QSpacerItem(0,0,QSizePolicy.Expanding), stretch=(0, 0, 0, 0, 1)))
         layout.addLayout(hline(self.save_dir_label, self.save_dir_edit, self.save_dir_button, stretch=(0, 1, 0)))
         layout.addLayout(hline(self.do_override, QLabel('Name prefix:'), self.prefix, stretch=(0, 0, 1)))
@@ -90,6 +96,14 @@ class CropResizeAndSaveToDialog(QDialog):
         if self.work_thread:
             self.work_thread.join()
         self.reject()
+
+    def on_image_croped(self, path):
+        self.num_job_done += 1
+        self.progress.setValue(self.num_job_done/len(self.files)*100)
+        self.item_map[path].setBackground(QColor(104, 159, 56))
+
+    def on_image_all_croped(self):
+        self.accept()
         
     def save_images(self):
         """Crop and save the selected images to the chosen directory"""
@@ -137,8 +151,7 @@ class CropResizeAndSaveToDialog(QDialog):
                 if override or not os.path.exists(save_path):
                     cropped_image.save(save_path)
                 self.image_cropped.emit(path)
-                self.item_list.removeItemWidget(self.item_map[path])
-            self.accept()
+            self.image_all_croped.emit()
 
         self.work_thread = threading.Thread(target=thread_function)
         self.work_thread.start()

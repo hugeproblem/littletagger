@@ -19,7 +19,7 @@ QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True) #use highdpi icons
 ImageRecord = namedtuple('ImageRecord', ['path', 'tag_path', 'tags'])
 
 def hline(*widgets, **kwargs):
-    stretch = kwargs.get('proportions', None)
+    stretch = kwargs.get('stretch', None)
     hbox = QHBoxLayout()
     for w in widgets:
         if isinstance(w, QWidget):
